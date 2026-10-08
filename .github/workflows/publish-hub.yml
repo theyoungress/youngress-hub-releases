@@ -1,0 +1,61 @@
+name: stage verified Hub installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Hub version
+        required: true
+        type: string
+      asset_manifest:
+        description: Short-lived download URLs, names, sizes and SHA-256 checksums for verified installer files
+        required: true
+        type: string
+
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 15
+    steps:
+      - name: Download and verify installer files
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          ASSET_MANIFEST: ${{ inputs.asset_manifest }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, urllib.parse, urllib.request
+          version = os.environ['RELEASE_VERSION']
+          assert re.fullmatch(r'\d+\.\d+\.\d+', version), 'Invalid release version'
+          items = json.loads(os.environ['ASSET_MANIFEST'])
+          expected = {'latest.yml', 'latest-mac.yml'}
+          for name in [f'Young-Ress-Hub-Setup-{version}.exe', f'Young-Ress-Hub-{version}-Mac.dmg', f'Young-Ress-Hub-{version}-Mac.zip']:
+              expected.update([name, name + '.blockmap'])
+          assert len(items) == len(expected) and {item['name'] for item in items} == expected, 'Unexpected installer files'
+          root = pathlib.Path('verified-installers')
+          root.mkdir()
+          for item in items:
+              url = urllib.parse.urlparse(item['url'])
+              assert url.scheme == 'https' and url.hostname == 'release-assets.githubusercontent.com' and not url.username and not url.password and not url.port, 'Untrusted asset download host'
+              assert re.fullmatch(r'[a-f0-9]{64}', item['sha256']), 'Invalid checksum'
+              assert isinstance(item['size'], int) and 0 < item['size'] < 500_000_000, 'Invalid asset size'
+              print('::add-mask::' + item['url'], flush=True)
+              digest = hashlib.sha256()
+              total = 0
+              with urllib.request.urlopen(item['url'], timeout=60) as response, (root / item['name']).open('wb') as output:
+                  while data := response.read(1024 * 1024):
+                      total += len(data)
+                      assert total <= item['size'], 'Asset exceeds expected size'
+                      digest.update(data)
+                      output.write(data)
+              assert total == item['size'] and digest.hexdigest() == item['sha256'], 'Asset checksum mismatch'
+              print(item['name'] + ': checksum verified')
+          PY
+      - name: Upload to the existing draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          [ "$(gh release view "v$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')" = true ] || { echo 'An existing draft release is required'; exit 1; }
+          gh release upload "v$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" verified-installers/* --clobber
